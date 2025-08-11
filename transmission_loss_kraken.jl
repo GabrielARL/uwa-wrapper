@@ -1,21 +1,52 @@
-# transmission_loss_kraken.jl — 2D TL grid (saves depths & tl_field)
+# transmission_loss_kraken.jl — 2D TL grid with depth-dependent SSP (SampledField-aware)
 using MAT
 using UnderwaterAcoustics
 using AcousticsToolbox
 using Printf
 using Statistics
 
-# ---- Helpers ----
-function effective_c(svp_in)::Float64
-    if haskey(svp_in, "c0")
+# ---------- Helpers ----------
+
+"""
+    build_soundspeed(svp_in) -> Union{Float64, SampledField}
+
+Accepts:
+  - svp_in["wssp"] :: Nx2 [depth(m, +down), c(m/s)]
+      -> SampledField with :cubic interpolation if depths are evenly spaced,
+         otherwise :linear.
+  - svp_in["c0"]   :: scalar m/s
+Depths are positive downward; UA uses z≤0 downward, so we map d -> z = -d.
+"""
+function build_soundspeed(svp_in)
+    if haskey(svp_in, "wssp")
+        w = svp_in["wssp"]
+        @assert size(w,2) == 2 "wssp must be Nx2 [depth(m), c(m/s)]"
+        d = Float64.(w[:,1])                 # positive depths
+        c = Float64.(w[:,2])                 # speeds
+        p = sortperm(d); d = d[p]; c = c[p]  # sort by depth
+        zvec = -d                            # z ≤ 0 is down
+
+        # If evenly spaced, allow :cubic (requires AbstractRange)
+        uniform = length(zvec) ≥ 2 ? all(abs.(diff(zvec) .- (zvec[2]-zvec[1])) .< 1e-9) : false
+        if uniform
+            Δ  = zvec[2] - zvec[1]
+            zr = range(zvec[1]; step=Δ, length=length(zvec))  # AbstractRange
+            return SampledField(c; z=zr, interp=:cubic)
+        else
+            return SampledField(c; z=zvec, interp=:linear)
+        end
+    elseif haskey(svp_in, "c0")
         return Float64(svp_in["c0"])
-    elseif haskey(svp_in, "wssp")
-        return mean(Float64.(svp_in["wssp"][:, 2]))
     else
         return 1500.0
     end
 end
 
+"""
+    normalize_bathymetry(bathy_any) -> Float64
+
+Scalar bathymetry passes; Nx2 [range, depth] reduced to mean depth (dummy for Kraken input).
+"""
 function normalize_bathymetry(bathy_any)::Float64
     if isa(bathy_any, Number)
         return Float64(bathy_any)
@@ -25,6 +56,11 @@ function normalize_bathymetry(bathy_any)::Float64
     end
 end
 
+"""
+    make_bathy_func(bathy_any) -> (r::Real) -> depth(m)
+
+Scalar -> constant; Nx2 -> piecewise linear, clamped at ends.
+"""
 function make_bathy_func(bathy_any)::Function
     if isa(bathy_any, Number)
         H = Float64(bathy_any)
@@ -47,6 +83,35 @@ function make_bathy_func(bathy_any)::Function
     end
 end
 
+"""
+    make_seabed(sb) -> FluidBoundary
+Requires sb["c"], sb["rho"]; optional sb["alpha"].
+"""
+function soundspeed_from_svp(svp_in)
+    if haskey(svp_in, "wssp")
+        w = svp_in["wssp"]
+        @assert size(w,2) == 2 "wssp must be Nx2 [depth, c]"
+        d = Float64.(w[:,1])    # depths, +down
+        c = Float64.(w[:,2])    # speeds
+        p = sortperm(d); d = d[p]; c = c[p]
+        z = -d                  # convert to model z (≤0 is down)
+
+        # evenly spaced? -> AbstractRange for :cubic
+        uniform = length(z) ≥ 2 ? all(abs.(diff(z) .- (z[2]-z[1])) .< 1e-9) : false
+        if uniform
+            Δz = z[2]-z[1]
+            zrange = range(z[1]; step=Δz, length=length(z))  # AbstractRange
+            return SampledField(c; z=zrange, interp=:cubic)
+        else
+            return SampledField(c; z=z, interp=:linear)
+        end
+    elseif haskey(svp_in, "c0")
+        return Float64(svp_in["c0"])
+    else
+        return 1500.0
+    end
+end
+
 function make_seabed(sb)::FluidBoundary
     c_sb   = Float64(sb["c"])
     rho_sb = Float64(sb["rho"])
@@ -61,7 +126,7 @@ function make_seabed(sb)::FluidBoundary
     end
 end
 
-# ---- Load inputs ----
+# ---------- Load inputs ----------
 mat = matopen("input_structs.mat")
 svp_in      = read(mat, "svp_in")
 env_in      = read(mat, "env_in")
@@ -69,10 +134,10 @@ opt_in      = read(mat, "opt_in")
 output_mode = read(mat, "output_mode")
 close(mat)
 
-# ---- Scalars & functions ----
-H_mean = normalize_bathymetry(env_in["bathymetry"])
-ρw     = Float64(env_in["water_density"])
-sb     = make_seabed(env_in["seabed"])
+# ---------- Scalars, fields, and grids ----------
+ρw   = Float64(env_in["water_density"])
+sb   = make_seabed(env_in["seabed"])
+cw   = build_soundspeed(svp_in)                  # Float64 or SampledField
 
 fc   = Float64(opt_in["fcw"])
 z_tx = haskey(opt_in, "ztx") ? -abs(Float64(opt_in["ztx"])) : -10.0
@@ -81,20 +146,21 @@ rmin = Float64(output_mode["rmin"])
 rmax = Float64(output_mode["rmax"])
 dr   = Float64(output_mode["range_step"])
 dz   = Float64(get(output_mode, "depth_step", 1.0))
-zpos = Float64(output_mode["zm"])            # keep for compatibility
+zpos = Float64(output_mode["zm"])                # kept for 1D compatibility
 z_rx = -abs(zpos)
 
-# Range grid
-ranges = collect(rmin:dr:rmax)
+# StepRange for x (range)
+xline = rmin:dr:rmax
 
-# Bathymetry checks (RX at all ranges; TX at r=0)
+# Bathymetry function and checks
 bathy_fn = make_bathy_func(env_in["bathymetry"])
-rx_depth = abs(z_rx); tx_depth = abs(z_tx)
-bathys   = map(bathy_fn, ranges)
+bathys   = map(bathy_fn, collect(xline))
+rx_depth = abs(z_rx)
+tx_depth = abs(z_tx)
 
 invalid_rx = findall(d -> rx_depth > d + 1e-9, bathys)
 if !isempty(invalid_rx)
-    bad_rs = join(round.(ranges[invalid_rx[1:min(end,10)]]; digits=3), ", ")
+    bad_rs = join(round.(collect(xline)[invalid_rx[1:min(end,10)]]; digits=3), ", ")
     error("Receiver depth $(rx_depth)m exceeds bathymetry at $(length(invalid_rx)) ranges. First: [$bad_rs]")
 end
 H_tx = bathy_fn(0.0)
@@ -102,16 +168,21 @@ if tx_depth > H_tx + 1e-9
     error("Transmitter depth $(tx_depth)m exceeds bathymetry $(H_tx)m at range 0 m")
 end
 
-# Depth grid (0..min depth along track)
-H_min = minimum(bathys)
-Nz = max(1, Int(floor(H_min/dz)) + 1)
-depths = range(0.0, step=dz, length=Nz) |> collect  # positive down
+# Depth grid as StepRange (negative z), and positive-down copy for MATLAB
+H_min  = minimum(bathys)
+zgrid  = (-H_min):dz:0.0                   # StepRange (z ≤ 0)
+depths = collect(0.0:dz:H_min)             # positive-down for MATLAB
 
-# ---- Environment & model ----
-c_eff = effective_c(svp_in)
+# ---------- Environment & model ----------
+# Kraken often expects numeric cw in its .env writer; be conservative:
+c_eff = cw isa Number ? cw :
+        (haskey(svp_in,"wssp") ? mean(Float64.(svp_in["wssp"][:,2])) : 1500.0)
+
+H_mean = normalize_bathymetry(env_in["bathymetry"])     # RD->mean for Kraken
+cw = soundspeed_from_svp(svp_in)  # Number or SampledField
 env = UnderwaterEnvironment(
-    bathymetry = H_mean,      # single representative depth for Kraken input
-    soundspeed = c_eff,       # scalar (Kraken expects numeric)
+    bathymetry = H_mean,
+    soundspeed = cw,                                  # scalar for Kraken stability
     density    = ρw,
     seabed     = sb,
 )
@@ -121,27 +192,13 @@ pm = Kraken(env; chigh = 1.1*max(1500.0, maxc))
 
 tx = AcousticSource(0.0, z_tx, fc)
 
-# --- Build grids as StepRanges (NOT vectors) ---
-xline = rmin:dr:rmax                  # StepRangeLen, good
-H_min = minimum(bathys)
-zgrid = (-H_min):dz:0.0               # negative (down) up to 0, also StepRangeLen
+# ---------- 2D TL (dB) ----------
+rxs   = AcousticReceiverGrid2D(xline, zgrid)   # StepRanges on both axes
+TL_db = transmission_loss(pm, tx, rxs)         # size: length(zgrid) × length(xline)
 
-# for saving to MATLAB (positive depth vector for imagesc)
-depths = collect(0.0:dz:H_min)
-
-# 2D TL
-rxs    = AcousticReceiverGrid2D(xline, zgrid)
-TL_db  = transmission_loss(pm, tx, rxs)   # size: length(zgrid) × length(xline)
-
-# single-depth line (keep using the StepRange for xline)
-rxs_ln   = AcousticReceiverGrid2D(xline, z_rx)
-TL_line  = transmission_loss(pm, tx, rxs_ln) |> vec
-
-# save
+# ---------- Save outputs ----------
 mat_out = matopen("pekeris_kraken_output.mat", "w")
-write(mat_out, "range", collect(xline))   # okay to collect for MATLAB I/O
+write(mat_out, "range", collect(xline))
 write(mat_out, "depths", depths)
-write(mat_out, "tl_field", TL_db)
-write(mat_out, "tl_line", TL_line)
+write(mat_out, "tl_field", TL_db)              # already in dB from Kraken wrapper
 close(mat_out)
-

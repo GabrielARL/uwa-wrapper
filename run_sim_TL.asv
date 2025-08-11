@@ -1,6 +1,8 @@
 % run_sim_TL.m — Example driver for the Kraken TL wrapper
 clear; clc;
+
 args = struct();
+
 % --- SVP ---
 args.svp.c0 = 1500;  % m/s
 % args.svp.wssp = [
@@ -35,11 +37,7 @@ args.out.rmax = 10^5;  % m
 args.out.dr   = 1000;    % m
 args.out.dz   = 1.0;     % m   % vertical resolution
 args.out.zm   = 0;    % m (positive depth for TL line output)
-%args.env.bathymetry_range = [0, 500, 1000];   % meters
-%args.env.bathymetry_depth = [50, 30, 60];     % meters
 
-% Build Nx2 [range, depth] table
-%args.env.bathymetry = [args.env.bathymetry_range(:), args.env.bathymetry_depth(:)];
 [range, depths, TL] = compute_transmisson_loss(args);
 
 % Convert to dB (10 log10)
